@@ -1,0 +1,255 @@
+---
+
+- name: Stop bot
+  hosts: telegram_bot
+  become: yes
+  tasks:
+    - name: Stop bot script
+      command: killall -9 python
+      async: 10
+      poll: 0
+      ignore_errors: yes
+
+- name: Install Python
+  hosts: all
+  become: yes
+  tasks:
+    - name: Ignore PEP 668 
+      ansible.builtin.file:
+        path: /usr/lib/python3.9/EXTERNALLY-MANAGED
+        state: absent
+    - name: Install Python 3
+      apt:
+        name: python3
+        state: present
+
+    - name: Install pip for Python 
+      apt:
+        name: python3-pip
+        state: present
+
+- name: Install PostgreSQL on primary and replica
+  hosts: primary_db replica_db
+  become: yes
+  tasks:
+    - name: "Install packages"
+      apt:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - postgresql
+        - postgresql-contrib
+    - name: Install psycopg2-binary
+      apt:
+        name: python3-psycopg2
+        state: present
+      become: yes
+    - name: Copy postgresql.conf
+      copy:
+        src: ./config-postgresql
+        dest: /etc/postgresql/15/main/postgresql.conf
+        mode: '0644'
+      become: yes
+    - name: Copy pg_hba.conf
+      copy:
+        src: ./pg_hba.conf
+        dest: /etc/postgresql/15/main/pg_hba.conf
+        mode: '0644'
+      become: yes
+    - name: Restart PostgreSQL service
+      ansible.builtin.systemd:
+        name: postgresql
+        state: restarted
+      become: yes
+
+- name: Setup primary database
+  hosts: primary_db
+  become: yes
+  environment:
+    POSTGRES_USER: "{{ DB_USER }}"
+    POSTGRES_PASSWORD: "{{ DB_PASSWORD }}"
+    DB_REPL_USER: "{{ DB_REPL_USER }}"
+    DB_REPL_PASSWORD: "{{ DB_REPL_PASSWORD }}"
+    DB_USER: "{{ DB_USER }}"
+    DB_PASSWORD: "{{ DB_PASSWORD }}"
+    DB_DATABASE: "{{ DB_DATABASE }}"
+  tasks:
+    - name: "Create database"
+      postgresql_db:
+        state: present
+        name: "{{ DB_DATABASE }}"
+      become: yes
+      become_user: postgres
+    - name: "Create db user"
+      postgresql_user:
+        state: present
+        name: "{{ DB_USER }}" 
+        password: '{{ DB_PASSWORD }}'
+      become: yes
+      become_user: postgres
+    - name: Grant all privileges on database to user
+      command: >
+        psql -U postgres -c "
+        GRANT CONNECT ON DATABASE "{{ DB_DATABASE }}" TO {{ DB_USER }};
+        GRANT ALL PRIVILEGES ON DATABASE "{{ DB_DATABASE }}" TO {{ DB_USER }};
+        "
+      become: yes
+      become_user: postgres
+    - name: Create PhoneNumbers table
+      postgresql_query:
+        db: "{{ DB_DATABASE }}"
+        query: |
+          CREATE TABLE IF NOT EXISTS Phones (
+            customerid SERIAL PRIMARY KEY,
+            numberphone VARCHAR(20) NOT NULL
+          );
+      become: yes
+      become_user: postgres
+    - name: Create Emails table
+      postgresql_query:
+        db: "{{ DB_DATABASE }}"
+        query: |
+          CREATE TABLE IF NOT EXISTS Emails (
+            customerid SERIAL PRIMARY KEY,
+            email VARCHAR(100) NOT NULL
+          );
+      become: yes
+      become_user: postgres
+    - name: Insert data into tables
+      postgresql_query:
+        db: "{{ DB_DATABASE }}"
+        query: |
+          INSERT INTO Emails (email) VALUES ('anton@@kpnn.ru'), ('Vova@kpnn.com') ON CONFLICT DO NOTHING;
+          INSERT INTO Phones (numberphone) VALUES ('+7(123)4567399'), ('8-012-345-90-89') ON CONFLICT DO NOTHING;
+      become: yes
+      become_user: postgres
+    - name: Create replication user
+      postgresql_user:
+        name: "{{ DB_REPL_USER }}"
+        password: '{{ DB_REPL_PASSWORD }}'
+        state: present
+        role_attr_flags: REPLICATION
+      become: yes
+      become_user: postgres
+    
+
+- name: Setup replica database
+  hosts: replica_db
+  become: yes
+  tasks:
+  
+    - name: Stop PostgreSQL service
+      ansible.builtin.systemd:
+        name: postgresql
+        state: stopped
+      become: yes
+    - name: Set up replication
+      shell: |
+        rm -rf  /etc/postgresql/15/main/*
+        pg_basebackup --pgdata=/etc/postgresql/15/main -R --username={{ DB_REPL_USER }} --host={{ DB_HOST }} --port=5432
+        chown -R postgres:postgres /etc/postgresql/15/main
+        chmod 0700 /etc/postgresql/15/main
+      register: result
+      environment:
+        DB_HOST: "{{ DB_HOST }}"
+        PGUSER: "{{ DB_REPL_USER }}"
+        PGPASSWORD: "{{ DB_REPL_PASSWORD }}"
+      become_user: postgres
+    - name: Restart PostgreSQL service
+      ansible.builtin.systemd:
+        name: postgresql
+        state: started
+      become: yes
+
+
+- name: Deploy Telegram bot
+  hosts: telegram_bot
+  become: yes
+  tasks:
+    - name: Install libpq-dev
+      apt:
+        name: libpq-dev
+        state: present
+    - name: Install Git
+      apt:
+        name: git
+        state: present
+    - name: Clone bot repository from GitHub
+      git:
+        repo: https://github.com/Ailenchick/DevOps_PT
+        dest: ~/devops
+        version: docker
+    - name: Install Python dependencies
+      pip:
+        requirements: ~/devops/devops_bot/bot/requirements.txt
+        state: present
+
+    - name: Give privs
+      file:
+        path: ~/devops/devops_bot/bot/bot.py
+        mode: '0755'
+    - name: Run bot script with environment variables
+      command: python3 ~/devops/devops_bot/bot/bot.py
+      environment:
+        RM_HOST: "{{ RM_HOST }}"
+        RM_PORT: "{{ RM_PORT }}"
+        RM_USER: "{{ RM_USER }}"
+        RM_PASSWORD: "{{ RM_PASSWORD }}"
+        DB_HOST: "{{ DB_HOST }}"
+        DB_PORT: "{{ DB_PORT }}"
+        DB_USER: "{{ DB_USER }}"
+        DB_PASSWORD: "{{ DB_PASSWORD }}"
+        DB_DATABASE: "{{ DB_DATABASE }}"
+        TOKEN: "{{ TOKEN }}"
+      async: 3600
+      poll: 0
+      ignore_errors: yes
+
+- name: Configure NFS shared folder between Linux machines
+  hosts: primary_db telegram_bot
+  become: yes
+  tasks:
+    - name: Install NFS server and client
+      apt:
+        name:
+          - nfs-kernel-server
+          - nfs-common
+        state: present
+
+- name: Export directory
+  hosts: primary_db
+  become: yes
+  tasks:
+    - name: Change permissions of the shared directory
+      file:
+        path: /var/log/postgresql
+        mode: '0755'
+      become: yes
+    - name: Change permissions of the shared directory
+      file:
+        path: /var/log/postgresql/logs.log
+        mode: '0755'
+      become: yes
+    - name: Export directory
+      lineinfile:
+        path: /etc/exports
+        line: '/var/log/postgresql *(rw,sync,no_subtree_check)'
+        create: yes
+        state: present
+    - name: Restart NFS server
+      service:
+        name: nfs-kernel-server
+        state: restarted
+
+- name: Mount NFS share on client
+  hosts: telegram_bot
+  become: yes
+  environment:
+    DB_HOST: "{{ DB_HOST }}"
+  tasks:
+    - name: Mount NFS share on client
+      mount:
+        path: /var/log/postgresql
+        src: "{{ DB_HOST }}:/var/log/postgresql"
+        fstype: nfs
+        state: mounted
